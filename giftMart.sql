@@ -1,4 +1,3 @@
-
 -- create stored proc to select into a table
 
 create or replace procedure pgarvey.populateGiftMart as
@@ -11,6 +10,3 @@ begin
 	order by 1;
 	commit;
 end;
-
-
-
