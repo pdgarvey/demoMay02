@@ -1,4 +1,4 @@
--- create stored proc to select into a table
+-- create stored proc to select into a table of gifts
 
 create or replace procedure pgarvey.populateGiftMart as
 begin
