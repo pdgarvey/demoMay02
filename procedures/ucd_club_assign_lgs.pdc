@@ -1,0 +1,486 @@
+CREATE OR REPLACE PROCEDURE "ADVANCE"."UCD_CLUB_ASSIGN_LGS" 
+IS
+/**************************************************************************
+
+NAME: @H:\_Applications Development\StoredProcedures\Internal\ucd_club_assign_lgs.sql
+
+PURPOSE:
+  This is to automate LGS, Leadership Giving Society, gift band process.
+  Frequency: on demand
+
+PARAMETERS: (NONE)
+
+MODIFICATION HISTORY:
+  10/13/2015  VL   Created
+
+**************************************************************************/
+
+  c_operator                  CONSTANT VARCHAR2(20) := 'GCLUB_ASSIGN_LGS';
+  c_group                     CONSTANT VARCHAR2(2)  := 'GC';
+
+  r_exception_context         adv_exception.t_exception_context;
+
+BEGIN
+  Adv_Exception.Register_Module ( r_exception_context
+                                , upper('ucd_club_assign_lgs')
+                                , adv_db_utils.get_proc_name() );
+
+-- Table holds new gift club info
+EXECUTE IMMEDIATE 'TRUNCATE TABLE ucd_tt_gift_club';
+
+/* people */
+INSERT INTO ucd_tt_gift_club
+      ( id_number
+      , club_code
+      , gift_total
+      , start_date
+      , end_date
+      , joint_ind
+      )
+WITH
+p_gifts AS (
+  SELECT x.id_number
+         , SUM(x.amt) amt
+         , x.gift_club_joint_ind
+    FROM (
+           SELECT DISTINCT b.id_number id_number
+                  , hg.recpt_num
+                  , CASE WHEN g.trans_pldg_code IN ('CP','BE') THEN hg.prim_pldg_amt_paid ELSE hg.prim_amt END amt
+                  , DECODE(MAX(CASE WHEN b.spouse_id_number <> ' ' THEN 1 ELSE 0 END) OVER(PARTITION BY hg.hh_id_number),1,'Y',' ') gift_club_joint_ind
+             FROM ucdr_hh_giving hg
+             JOIN ucdr_bio b ON hg.hh_id_number = b.hh_id_number
+             LEFT
+             JOIN ucdr_giving_devarea_cpbe g ON hg.recpt_num = g.recpt_num AND b.id_number = g.id_number
+) x
+GROUP BY x.id_number
+         , x.gift_club_joint_ind
+)
+
+  -- union to use same set of sub-queries
+  SELECT gs.id_number
+         , cl.club_code
+         , gs.amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , gs.gift_club_joint_ind
+    FROM p_gifts gs
+    JOIN ucd_tms_lgs_club_levels cl ON gs.amt BETWEEN cl.min_amt AND cl.max_amt
+  UNION
+  SELECT gs.id_number
+         , NVL(cl.club_code,gc.gift_club_code) club_code
+         , gs.amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , gs.gift_club_joint_ind
+    FROM p_gifts gs
+    LEFT
+    JOIN ucd_tms_lgs_club_levels cl ON gs.amt BETWEEN cl.min_amt AND cl.max_amt
+    LEFT -- existing in gift_club - amt changed
+    JOIN gift_clubs gc ON gs.id_number = gc.gift_club_id_number AND gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06') AND
+                          gc.gift_club_status = 'A' AND
+                          to_char(gs.amt) <> gc.gift_club_reason
+   WHERE gc.gift_club_id_number IS NOT NULL
+  UNION  -- gifts reversed, entity shows no giviging in Advance
+  SELECT gc.gift_club_id_number id_number
+         , gc.gift_club_code club_code
+         , NVL(gs.amt,0) amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , gc.gift_club_joint_ind
+    FROM gift_clubs gc
+    JOIN ucdr_bio b ON gc.gift_club_id_number = b.id_number AND b.pers_org_ind = 'P'
+    LEFT
+    JOIN p_gifts gs ON gc.gift_club_id_number = gs.id_number --AND gs.amt >= 50000
+   WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+         AND gc.gift_club_status = 'A'
+         AND gs.id_number IS NULL  -- gifts reversed in Advance
+;
+
+/*orgs that have PS parent orgs*/
+INSERT INTO ucd_tt_gift_club
+      ( id_number
+      , club_code
+      , gift_total
+      , start_date
+      , end_date
+      , joint_ind
+      )
+WITH
+has_ps AS (  -- handle one or more level of subsidiary companies
+  SELECT x.id_number, ib.pers_org_ind, x.real_parent real_parent_id_number
+    FROM (
+           SELECT id_number, MAX(real_parent) real_parent
+             FROM (
+                    SELECT id_number, parent_id_number, lvl, parent,
+                           CASE WHEN lvl = MAX(lvl) OVER (PARTITION BY id_number) THEN parent ELSE ' ' END real_parent
+                      FROM (
+                            SELECT o.id_number, o.parent_id_number, LEVEL lvl, connect_by_root parent_id_number parent
+                              FROM org_relationship o
+                             WHERE o.active_ind='Y'
+                           CONNECT BY PRIOR id_number = parent_id_number
+                           )
+                  )
+         GROUP BY id_number
+         ) x
+    JOIN ucdr_bio b ON x.real_parent = b.id_number AND b.record_type_code = 'PS' AND b.record_stat_code = 'P'
+    JOIN ucdr_bio ib ON x.id_number = ib.id_number
+)
+, ps_giving AS (
+  SELECT g.id_number
+         , SUM(CASE WHEN trans_pldg_code IN ('CP','BE') THEN prim_pldg_amt_paid
+                    ELSE prim_amt END) total_credit
+         , b.pers_org_ind
+    from (
+          SELECT DISTINCT o.real_parent_id_number id_number
+                 , MAX(prim_amt) OVER(PARTITION BY o.real_parent_id_number, g.recpt_num) prim_amt
+                 , MAX(prim_pldg_amt_paid) OVER(PARTITION BY o.real_parent_id_number, g.recpt_num) prim_pldg_amt_paid
+                 , trans_pldg_code, g.recpt_num
+            FROM ucdr_giving_devarea_cpbe g, has_ps o
+           WHERE o.id_number  = g.id_number
+                 AND assoc_code not in ('M','H')
+         ) g
+         , ucdr_bio b
+   WHERE g.id_number = b.id_number
+         AND b.record_type_code = 'PS'
+         AND b.pers_org_ind = 'O'
+GROUP BY g.id_number, b.pers_org_ind
+)
+, hp_gifts AS (  -- main list
+  -- children
+  SELECT hp.id_number
+         , hp.real_parent_id_number
+         , pg.total_credit
+         , hp.pers_org_ind
+    FROM has_ps hp
+    JOIN ps_giving pg ON hp.real_parent_id_number = pg.id_number
+   WHERE hp.pers_org_ind = 'O'
+  UNION
+  -- parent
+  SELECT pg.id_number
+         , ' '
+         , pg.total_credit
+         , pg.pers_org_ind
+    FROM ps_giving pg
+)
+
+  -- union to use same set of sub-queries
+SELECT DISTINCT id_number, MAX(club_code) OVER (PARTITION BY id_number) club_code
+, total_credit, start_date, end_date, gift_club_joint_ind
+FROM (
+  SELECT DISTINCT gs.id_number
+         , cl.club_code
+         , gs.total_credit
+         , to_char(SYSDATE,'yyyymmdd') start_date
+         , '00000000' end_date
+         , ' ' gift_club_joint_ind
+    from hp_gifts gs
+    JOIN ucd_tms_lgs_club_levels cl ON gs.total_credit BETWEEN cl.min_amt AND cl.max_amt
+         AND cl.club_hierarchy <= DECODE(gs.pers_org_ind, 'O', 2)  -- 'O' from 1 mil
+  UNION
+  SELECT DISTINCT gs.id_number
+         , gc.gift_club_code  -- retain club_code
+         , gs.total_credit
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , ' ' gift_club_joint_ind
+    FROM hp_gifts gs
+    LEFT -- existing in gift_club - amt changed
+    JOIN gift_clubs gc ON gs.id_number = gc.gift_club_id_number AND gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06') AND
+                          gc.gift_club_status = 'A' AND
+                          to_char(gs.total_credit) <> gc.gift_club_reason
+   WHERE gc.gift_club_id_number IS NOT NULL
+)
+;
+
+/* orgs that do not have prospect summary parent orgs */
+INSERT INTO ucd_tt_gift_club
+      ( id_number
+      , club_code
+      , gift_total
+      , start_date
+      , end_date
+      , joint_ind
+      )
+WITH
+has_ps AS (  -- handle one or more level of subsidiary companies
+  SELECT x.id_number, ib.pers_org_ind, x.real_parent real_parent_id_number
+    FROM (
+           SELECT id_number, MAX(real_parent) real_parent
+             FROM (
+                    SELECT id_number, parent_id_number, lvl, parent,
+                           CASE WHEN lvl = MAX(lvl) OVER (PARTITION BY id_number) THEN parent ELSE ' ' END real_parent
+                      FROM (
+                            SELECT o.id_number, o.parent_id_number, LEVEL lvl, connect_by_root parent_id_number parent
+                              FROM org_relationship o
+                             WHERE o.active_ind='Y'
+                           CONNECT BY PRIOR id_number = parent_id_number
+                           )
+                  )
+         GROUP BY id_number
+         ) x
+    JOIN ucdr_bio b ON x.real_parent = b.id_number AND b.record_type_code = 'PS' AND b.record_stat_code = 'P'
+    JOIN ucdr_bio ib ON x.id_number = ib.id_number
+)
+, has_no_ps as(
+  SELECT b.id_number
+    FROM ucdr_bio b
+   WHERE b.pers_org_ind = 'O'
+         AND b.id_number NOT IN ( SELECT id_number FROM has_ps )
+)
+, np_gifts AS (
+  SELECT b.id_number
+         , SUM(CASE WHEN g.trans_pldg_code IN ('CP','BE') THEN g.prim_pldg_amt_paid ELSE g.prim_amt END )amt
+         , b.pers_org_ind
+    FROM ucdr_bio b, ucdr_giving_devarea_cpbe g, has_no_ps p
+   WHERE g.id_number = b.id_number
+         AND b.id_number = p.id_number
+         AND b.pers_org_ind = 'O'
+GROUP BY b.id_number, b.pers_org_ind
+)
+
+  -- union to use same set of sub-queries
+  SELECT gs.id_number
+         , cl.club_code
+         , gs.amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , ' ' gift_club_joint_ind
+    FROM np_gifts gs
+    JOIN ucd_tms_lgs_club_levels cl ON gs.amt BETWEEN cl.min_amt AND cl.max_amt
+         AND cl.club_hierarchy <= DECODE(gs.pers_org_ind, 'O', 2)  -- 'O' from 1 mil
+  UNION
+  SELECT gs.id_number
+         , gc.gift_club_code  -- retain club_code
+         , gs.amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , ' ' gift_club_joint_ind
+    FROM np_gifts gs
+    LEFT -- existing in gift_club - amt changed
+    JOIN gift_clubs gc ON gs.id_number = gc.gift_club_id_number AND gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06') AND
+                          gc.gift_club_status = 'A' AND
+                          to_char(gs.amt) <> gc.gift_club_reason
+   WHERE gc.gift_club_id_number IS NOT NULL
+  UNION  -- gifts reversed, entity has no giviging in Advance any more
+  SELECT gc.gift_club_id_number id_number
+         , gc.gift_club_code club_code
+         , NVL(gs.amt,0) amt
+         , to_char(SYSDATE,'yyyymmdd')
+         , '00000000'
+         , gc.gift_club_joint_ind
+    FROM gift_clubs gc
+    JOIN ucdr_bio b ON gc.gift_club_id_number = b.id_number AND b.pers_org_ind = 'O'
+    LEFT
+    JOIN org_relationship o ON gc.gift_club_id_number IN (o.id_number, o.parent_id_number)
+    LEFT
+    JOIN np_gifts gs ON gc.gift_club_id_number = gs.id_number --AND gs.amt >= 1000000
+   WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+         AND gc.gift_club_status = 'A'
+         AND o.parent_id_number IS NULL   -- having no PS
+         AND gs.id_number IS NULL
+;
+
+-- 1. add new - not yet in gc
+FOR c_new IN (
+  SELECT t.*, gc.gift_club_code, gc.gift_club_reason
+    FROM ucd_tt_gift_club t
+    LEFT
+    JOIN gift_clubs gc ON t.id_number = gc.gift_club_id_number AND
+         gc.gift_club_status = 'A' AND
+         gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+   WHERE gc.gift_club_id_number IS NULL
+  ) LOOP
+
+  INSERT INTO gift_clubs gc
+   ( gift_club_id_number
+   , gift_club_code
+   , gift_club_type
+   , gift_club_end_date
+   , gift_club_sequence
+   , gift_club_start_date
+   , gift_club_status
+   , gift_club_generated_asgnd
+   , gift_club_person_authorized
+   , gift_club_user_assigned
+   , gift_club_reason
+   , gift_club_comment
+   , school_code
+   , gift_club_joint_ind
+   , gift_club_partner_id
+   , unit_code
+   , date_added
+   , date_modified
+   , operator_name
+   , user_group
+   , location_id
+   , data_source_code
+)
+  SELECT tgc.id_number
+         , tgc.club_code
+         , ' '
+         , tgc.end_date
+         -- Get the largest gift club sequence  and increment
+         , ( SELECT NVL(MAX(gift_club_sequence), 0) + 1
+               FROM gift_clubs g1
+              WHERE g1.gift_club_id_number = tgc.id_number )
+	       -- End date is the end of the following fiscal year
+         , tgc.start_date
+         , 'A'
+         , ' '
+         , ' '
+         , ' '
+         , to_char(tgc.gift_total)
+         , ' '
+         , ' '
+         , tgc.joint_ind
+         , ' '
+         , ' '
+         , SYSDATE
+         , SYSDATE
+         , c_operator
+         , c_group
+         , NULL
+         , ' '
+    FROM ucd_tt_gift_club tgc
+   WHERE tgc.id_number = c_new.id_number;
+  END LOOP;
+
+-- 2. add new level
+FOR c_new_level IN (  -- add new level and 'U' old level in change_status
+  SELECT t.*, gc.gift_club_code, gc.gift_club_reason
+    FROM ucd_tt_gift_club t
+    JOIN gift_clubs gc ON t.id_number = gc.gift_club_id_number
+   WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+         AND gc.gift_club_status = 'A'
+         AND gc.gift_club_code <> t.club_code
+         AND to_number(NVL(TRIM(gc.gift_club_reason),'0')) < t.gift_total
+  ) LOOP
+
+  INSERT INTO gift_clubs gc
+   ( gift_club_id_number
+   , gift_club_code
+   , gift_club_type
+   , gift_club_end_date
+   , gift_club_sequence
+   , gift_club_start_date
+   , gift_club_status
+   , gift_club_generated_asgnd
+   , gift_club_person_authorized
+   , gift_club_user_assigned
+   , gift_club_reason
+   , gift_club_comment
+   , school_code
+   , gift_club_joint_ind
+   , gift_club_partner_id
+   , unit_code
+   , date_added
+   , date_modified
+   , operator_name
+   , user_group
+   , location_id
+   , data_source_code
+)
+  SELECT tgc.id_number
+         , tgc.club_code
+         , ' '
+         , tgc.end_date
+         -- Get the largest gift club sequence  and increment
+         , ( SELECT NVL(MAX(gift_club_sequence), 0) + 1
+               FROM gift_clubs g1
+              WHERE g1.gift_club_id_number = tgc.id_number )
+	       -- End date is the end of the following fiscal year
+         , tgc.start_date
+         , 'A'
+         , ' '
+         , ' '
+         , ' '
+         , to_char(tgc.gift_total)
+         , ' '
+         , ' '
+         , tgc.joint_ind
+         , ' '
+         , ' '
+         , SYSDATE
+         , SYSDATE
+         , c_operator
+         , c_group
+         , NULL
+         , ' '
+    FROM ucd_tt_gift_club tgc
+   WHERE tgc.id_number = c_new_level.id_number;
+  END LOOP;
+
+  COMMIT;
+
+-- 3. update status of old level to 'U'
+FOR c_change_status IN (
+WITH
+u_list AS (
+  SELECT id_number, xsequence
+    FROM (
+          SELECT COUNT(*), gc.gift_club_id_number id_number, MIN(gc.gift_club_sequence) xsequence
+            FROM gift_clubs gc
+           WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+                 AND gc.gift_club_status = 'A'
+        GROUP BY gc.gift_club_id_number
+          HAVING COUNT(*) > 1
+         )
+)
+
+  SELECT gc.gift_club_id_number id_number, gc.gift_club_sequence xsequence
+    FROM gift_clubs gc
+    JOIN u_list l ON gc.gift_club_id_number = l.id_number AND gc.gift_club_sequence = l.xsequence
+   WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+         AND gc.gift_club_status = 'A'
+  ) LOOP
+
+      UPDATE gift_clubs i
+         SET i.gift_club_status = 'U'
+             , i.gift_club_end_date = to_char(SYSDATE,'yyyymmdd')
+             , i.date_modified = SYSDATE
+             , operator_name = c_operator
+             , user_group = c_group
+       WHERE i.gift_club_id_number = c_change_status.id_number
+             AND i.gift_club_sequence = c_change_status.xsequence
+             AND i.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+             AND i.gift_club_status = 'A';
+  END LOOP;
+
+  COMMIT;
+
+-- 4. update amt to existing gc
+FOR c_new_amt IN (
+  SELECT t.*, gc.gift_club_code, gc.gift_club_reason
+    FROM ucd_tt_gift_club t
+    JOIN gift_clubs gc ON t.id_number = gc.gift_club_id_number AND gc.gift_club_status = 'A'
+   WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+         AND to_number(NVL(TRIM(gc.gift_club_reason),'0')) <> t.gift_total
+  ) LOOP
+
+      UPDATE gift_clubs i
+         SET i.gift_club_reason = to_char(c_new_amt.gift_total)
+             , i.date_modified = SYSDATE
+             , operator_name = c_operator
+             , user_group = c_group
+       WHERE i.gift_club_id_number = c_new_amt.id_number
+             AND i.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
+             AND i.gift_club_status = 'A';
+  END LOOP;
+
+  COMMIT;
+
+EXCEPTION
+  WHEN OTHERS THEN
+    Adv_Exception.Log_Exception
+     ( r_exception_context
+     , Adv_Exception.c_Unspecified
+     , dbms_utility.format_error_stack() );
+
+    RAISE;
+END ucd_club_assign_lgs;
+
+
+
+/
+  GRANT EXECUTE ON "ADVANCE"."UCD_CLUB_ASSIGN_LGS" TO "DW_ADMIN";
+  GRANT EXECUTE ON "ADVANCE"."UCD_CLUB_ASSIGN_LGS" TO "ADVSEL";
