@@ -95,7 +95,7 @@ GROUP BY x.id_number
          AND gc.gift_club_status = 'A'
          AND gs.id_number IS NULL  -- gifts reversed in Advance
          and b.date_of_birth not like '01%'
-;
+; /*jan people are getting their own special club!*/
 
 /*orgs that have PS parent orgs*/
 INSERT INTO ucd_tt_gift_club
