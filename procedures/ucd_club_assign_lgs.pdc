@@ -94,7 +94,8 @@ GROUP BY x.id_number
    WHERE gc.gift_club_code IN ('C01','C02','C03','C04','C05','C06')
          AND gc.gift_club_status = 'A'
          AND gs.id_number IS NULL  -- gifts reversed in Advance
-;
+         and b.date_of_birth not like '01%' or not like 'BLAH'
+; /*jan people are getting their own special club!*/
 
 /*orgs that have PS parent orgs*/
 INSERT INTO ucd_tt_gift_club
